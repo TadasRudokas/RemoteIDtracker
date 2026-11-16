@@ -13,7 +13,7 @@
   * { box-sizing:border-box; }
   html, body { height:100%; margin:0; }
   body { font-family: system-ui, sans-serif; background:var(--bg); color:var(--ink); display:flex; flex-direction:column; }
-  header { display:flex; align-items:center; gap:12px; padding:10px 14px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:10px 14px; background:var(--panel); border-bottom:1px solid var(--line); }
   header h1 { font-size:16px; margin:0; flex:1; }
   #status { font-size:13px; color:var(--muted); }
   button { font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--ink); background:var(--ink); color:var(--bg); cursor:pointer; }
@@ -35,6 +35,8 @@
 <header>
   <h1>Remote ID Map</h1>
   <span id="status">Not connected</span>
+  <button id="sound">Sound on</button>
+  <button id="me">Me</button>
   <button id="connect">Connect scanner</button>
 </header>
 <main>
@@ -57,10 +59,85 @@ const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).
 const drones = {};   // key: mac
 let fitted = false;
 
+// ----- My location -----
+const me = L.circleMarker([0, 0], { radius: 7, color: "#fff", weight: 2, fillColor: "#2e9e5b", fillOpacity: 1 });
+const meAcc = L.circle([0, 0], { radius: 0, color: "#2e9e5b", weight: 1, fillOpacity: .1 });
+let myPos = null, centeredOnMe = false;
+
+function startLocation() {
+  if (!navigator.geolocation) return;
+  navigator.geolocation.watchPosition(p => {
+    myPos = [p.coords.latitude, p.coords.longitude];
+    me.setLatLng(myPos).addTo(map);
+    meAcc.setLatLng(myPos).setRadius(p.coords.accuracy).addTo(map);
+    me.bindTooltip("You");
+    if (!fitted && !centeredOnMe) { map.setView(myPos, 15); centeredOnMe = true; }
+  }, e => console.warn("Location error", e.message), { enableHighAccuracy: true, maximumAge: 5000 });
+}
+
+function distText(d) {
+  if (!myPos || !d.loc) return "";
+  const m = map.distance(myPos, [d.lat, d.lon]);
+  return " · " + (m >= 1000 ? (m / 1000).toFixed(1) + " km" : Math.round(m) + " m") + " from you";
+}
+
+// ----- Alerts and keep-alive -----
+let soundOn = true, audioCtx = null, keepAudio = null, wakeLock = null;
+
+function tone(f, start, dur) {
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.frequency.value = f; o.connect(g); g.connect(audioCtx.destination);
+  const t = audioCtx.currentTime + start;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.4, t + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+
+function alertNew() {
+  if (!soundOn) return;
+  if (audioCtx) {
+    audioCtx.resume();
+    tone(880, 0, .18); tone(1175, .22, .18); tone(880, .44, .18); tone(1175, .66, .3);
+  }
+  if (navigator.vibrate) navigator.vibrate([250, 100, 250, 100, 250]);
+}
+
+// 1 second of silence, looped, so the browser treats the page as playing media
+function silentWav() {
+  const n = 8000, b = new DataView(new ArrayBuffer(44 + n));
+  const w = (o, s) => [...s].forEach((c, i) => b.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); b.setUint32(4, 36 + n, true); w(8, "WAVEfmt ");
+  b.setUint32(16, 16, true); b.setUint16(20, 1, true); b.setUint16(22, 1, true);
+  b.setUint32(24, 8000, true); b.setUint32(28, 8000, true); b.setUint16(32, 1, true); b.setUint16(34, 8, true);
+  w(36, "data"); b.setUint32(40, n, true);
+  for (let i = 0; i < n; i++) b.setUint8(44 + i, 128);
+  return URL.createObjectURL(new Blob([b], { type: "audio/wav" }));
+}
+
+async function initAlerts() {
+  try { audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)(); await audioCtx.resume(); } catch (e) {}
+  try {
+    if (!keepAudio) { keepAudio = new Audio(silentWav()); keepAudio.loop = true; }
+    await keepAudio.play();
+    if ("mediaSession" in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: "Remote ID scanner running" });
+  } catch (e) {}
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+
+document.addEventListener("visibilitychange", async () => {
+  if (document.visibilityState === "visible" && statusEl.textContent.startsWith("Connected")) {
+    try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+  }
+});
+
+startLocation();
+
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
 function update(m) {
   let d = drones[m.mac];
+  const alertNow = !d || Date.now() - d.seen > STALE_MS;
   if (!d) {
     d = drones[m.mac] = { track: [], seen: 0 };
     d.marker = L.circleMarker([0, 0], { radius: 9, color: css("--drone"), fillColor: css("--drone"), fillOpacity: .8 });
@@ -69,6 +146,7 @@ function update(m) {
     d.link = L.polyline([], { color: css("--op"), weight: 1, dashArray: "4 6" });
   }
   Object.assign(d, m, { seen: Date.now() });
+  if (alertNow) alertNew();
 
   if (m.loc) {
     const p = [m.lat, m.lon];
@@ -95,7 +173,7 @@ function render() {
     return `<div class="item ${Date.now() - d.seen > STALE_MS ? "stale" : ""}" data-k="${k}">
       <b>${esc(d.id || "Unknown ID")}</b><br>
       Operator ID: ${esc(d.op || "not received")}<br>
-      <span class="muted">${d.loc ? `${d.lat.toFixed(5)}, ${d.lon.toFixed(5)}` : "No position yet"}</span><br>
+      <span class="muted">${d.loc ? `${d.lat.toFixed(5)}, ${d.lon.toFixed(5)}` : "No position yet"}${distText(d)}</span><br>
       <span class="muted">${d.loc ? `Alt ${d.alt} m · ${d.spd} m/s · ` : ""}${esc(d.src)} ${d.rssi} dBm · ${age}s ago</span>
     </div>`;
   }).join("");
@@ -124,6 +202,7 @@ function onData(ev) {
 }
 
 async function connect() {
+  initAlerts();
   if (!navigator.bluetooth) {
     statusEl.textContent = "Web Bluetooth not supported. Use Chrome on Android.";
     return;
@@ -144,6 +223,12 @@ async function connect() {
   }
 }
 document.getElementById("connect").addEventListener("click", connect);
+document.getElementById("sound").addEventListener("click", async e => {
+  soundOn = !soundOn;
+  e.target.textContent = soundOn ? "Sound on" : "Sound off";
+  if (soundOn) { await initAlerts(); alertNew(); }
+});
+document.getElementById("me").addEventListener("click", () => { if (myPos) map.setView(myPos, 16); });
 </script>
 </body>
 </html>
