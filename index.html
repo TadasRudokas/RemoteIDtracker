@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remote ID Map</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+  :root { --bg:#f6f7f4; --panel:#ffffff; --ink:#1c2420; --muted:#66706a; --line:#d9ded8; --drone:#d4380d; --op:#1d6fb8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161b18; --panel:#1f2622; --ink:#e8ece9; --muted:#97a19a; --line:#303a34; --drone:#ff7a45; --op:#5aa9f0; }
+  }
+  * { box-sizing:border-box; }
+  html, body { height:100%; margin:0; }
+  body { font-family: system-ui, sans-serif; background:var(--bg); color:var(--ink); display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 14px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; flex:1; }
+  #status { font-size:13px; color:var(--muted); }
+  button { font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--ink); background:var(--ink); color:var(--bg); cursor:pointer; }
+  main { flex:1; display:flex; min-height:0; }
+  #map { flex:1; }
+  #list { width:300px; overflow-y:auto; background:var(--panel); border-left:1px solid var(--line); }
+  .item { padding:10px 14px; border-bottom:1px solid var(--line); cursor:pointer; font-size:13px; line-height:1.5; }
+  .item b { font-size:14px; }
+  .item.stale { opacity:.5; }
+  .muted { color:var(--muted); }
+  #empty { padding:14px; color:var(--muted); font-size:13px; }
+  @media (max-width: 700px) {
+    main { flex-direction:column; }
+    #list { width:100%; height:35%; border-left:0; border-top:1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Remote ID Map</h1>
+  <span id="status">Not connected</span>
+  <button id="connect">Connect scanner</button>
+</header>
+<main>
+  <div id="map"></div>
+  <div id="list"><div id="empty">No drones yet. Connect the scanner and wait for a broadcast.</div></div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script>
+const SVC = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const TX  = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+const STALE_MS = 60000;
+
+const map = L.map("map").setView([54.7, 21.1], 5);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19, attribution: "&copy; OpenStreetMap contributors"
+}).addTo(map);
+
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const drones = {};   // key: mac
+let fitted = false;
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function update(m) {
+  let d = drones[m.mac];
+  if (!d) {
+    d = drones[m.mac] = { track: [], seen: 0 };
+    d.marker = L.circleMarker([0, 0], { radius: 9, color: css("--drone"), fillColor: css("--drone"), fillOpacity: .8 });
+    d.trail = L.polyline([], { color: css("--drone"), weight: 2, opacity: .6 });
+    d.opMarker = L.circleMarker([0, 0], { radius: 6, color: css("--op"), fillColor: css("--op"), fillOpacity: .8 });
+    d.link = L.polyline([], { color: css("--op"), weight: 1, dashArray: "4 6" });
+  }
+  Object.assign(d, m, { seen: Date.now() });
+
+  if (m.loc) {
+    const p = [m.lat, m.lon];
+    d.marker.setLatLng(p).addTo(map);
+    d.track.push(p); if (d.track.length > 200) d.track.shift();
+    d.trail.setLatLngs(d.track).addTo(map);
+    if (!fitted) { map.setView(p, 16); fitted = true; }
+  }
+  if (m.hasop) {
+    d.opMarker.setLatLng([m.olat, m.olon]).addTo(map);
+    if (m.loc) d.link.setLatLngs([[m.lat, m.lon], [m.olat, m.olon]]).addTo(map);
+  }
+  d.marker.bindTooltip(esc(d.id || d.mac), { permanent: true, direction: "top", offset: [0, -8] });
+  d.opMarker.bindTooltip("Operator " + esc(d.op || "(unknown)"));
+  render();
+}
+
+function render() {
+  const list = document.getElementById("list");
+  const keys = Object.keys(drones).sort((a, b) => drones[b].seen - drones[a].seen);
+  if (!keys.length) return;
+  list.innerHTML = keys.map(k => {
+    const d = drones[k], age = Math.round((Date.now() - d.seen) / 1000);
+    return `<div class="item ${Date.now() - d.seen > STALE_MS ? "stale" : ""}" data-k="${k}">
+      <b>${esc(d.id || "Unknown ID")}</b><br>
+      Operator ID: ${esc(d.op || "not received")}<br>
+      <span class="muted">${d.loc ? `${d.lat.toFixed(5)}, ${d.lon.toFixed(5)}` : "No position yet"}</span><br>
+      <span class="muted">${d.loc ? `Alt ${d.alt} m · ${d.spd} m/s · ` : ""}${esc(d.src)} ${d.rssi} dBm · ${age}s ago</span>
+    </div>`;
+  }).join("");
+}
+
+document.getElementById("list").addEventListener("click", e => {
+  const el = e.target.closest(".item"); if (!el) return;
+  const d = drones[el.dataset.k];
+  if (d && d.loc) map.setView([d.lat, d.lon], 17);
+});
+setInterval(render, 1000);
+
+// ----- Bluetooth -----
+const statusEl = document.getElementById("status");
+let buf = "";
+const dec = new TextDecoder();
+
+function onData(ev) {
+  buf += dec.decode(ev.target.value);
+  let i;
+  while ((i = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+    if (!line) continue;
+    try { update(JSON.parse(line)); } catch (e) { console.warn("Bad line", line); }
+  }
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    statusEl.textContent = "Web Bluetooth not supported. Use Chrome on Android.";
+    return;
+  }
+  try {
+    statusEl.textContent = "Choose your scanner...";
+    const dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
+    dev.addEventListener("gattserverdisconnected", () => { statusEl.textContent = "Disconnected"; });
+    const server = await dev.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    const ch = await svc.getCharacteristic(TX);
+    ch.addEventListener("characteristicvaluechanged", onData);
+    await ch.startNotifications();
+    buf = "";
+    statusEl.textContent = "Connected to " + dev.name;
+  } catch (e) {
+    statusEl.textContent = "Connection failed: " + e.message;
+  }
+}
+document.getElementById("connect").addEventListener("click", connect);
+</script>
+</body>
+</html>
